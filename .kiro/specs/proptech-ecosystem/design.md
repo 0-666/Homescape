@@ -206,20 +206,54 @@ interface Property {
 - **3D Model Format**: GLB (GL Transmission Format Binary) - industry standard for web 3D
 - **3D Viewer Library**: Three.js (primary) with React Three Fiber for React integration
 - **Alternative Viewer**: Babylon.js for advanced rendering features
-- **AI Generation Service**: Luma AI Genie API for text-to-3D and image-to-3D conversion
+- **AI Generation Service**: World Labs Marble API for image-to-3D world generation
 - **Model Optimization**: Draco compression for efficient web delivery
 - **Rendering**: WebGL 2.0 for browser-based 3D rendering
+
+**Builder Upload Options**:
+The platform supports multiple input methods for generating 3D apartment models:
+1. **2D Images/Photos**: Upload apartment photos → Marble AI generates full 3D interior
+2. **Video Walkthrough**: Upload video → Extract frames → Marble AI generates 3D reconstruction
+3. **Floor Plan**: Upload floor plan → Generate base structure → Marble AI enhances with interior details
+4. **Pre-built Template**: Select from existing templates (if available)
 
 **Interfaces**:
 
 ```typescript
 interface StudioService {
+  // Builder upload methods
+  generateFromImages(images: File[], autoEnhance: boolean, draft: boolean): Promise<string> // Returns operation_id
+  generateFromVideo(video: File, autoEnhance: boolean, draft: boolean): Promise<string> // Returns operation_id
+  generateFromFloorPlan(floorPlan: File): Promise<string> // Returns operation_id
+  
+  // Operation status checking
+  getOperationStatus(operationId: string): Promise<GenerationOperation>
+  getWorld(worldId: string): Promise<World3D>
+  
+  // User customization methods
   load3DModel(propertyId: string): Promise<Model3D>
   customizeWithText(modelId: string, prompt: string): Promise<DesignAsset>
   customizeWithImage(modelId: string, imageUrl: string): Promise<DesignAsset>
   saveDesign(userId: string, propertyId: string, design: DesignAsset): Promise<string>
   getDesign(designId: string): Promise<DesignAsset>
   listUserDesigns(userId: string): Promise<DesignAsset[]>
+}
+
+interface GenerationOperation {
+  operation_id: string
+  done: boolean
+  response?: {
+    world_id: string
+  }
+  error?: string
+}
+
+interface World3D {
+  world_id: string
+  model_url: string
+  thumbnail_url: string
+  metadata: Record<string, any>
+  created_at: Date
 }
 
 interface Model3D {
@@ -251,18 +285,89 @@ enum DesignStatus {
 ```
 
 **Implementation Notes**:
-- Primary 3D generation: **Luma AI Genie** for text-to-3D and image-to-3D generation
-  - Supports high-quality 3D mesh generation from text prompts
-  - Provides image-conditioned 3D generation for style transfer
-  - API-based integration with reasonable generation times (10-20 seconds)
-- Fallback option: **Meshy AI** for additional capacity and redundancy
-- Alternative for simpler use cases: **Spline AI** for real-time 3D scene editing
-- Use job queue (Bull/Redis) for asynchronous 3D generation
+
+**World Labs Marble API Integration**:
+- API Base URL: `https://api.worldlabs.ai/marble/v1`
+- Authentication: Header `WLT-Api-Key: <api_key>`
+- Models available: 
+  - `Marble 0.1-plus` (high quality, slower)
+  - `Marble 0.1-mini` (draft quality, faster)
+
+**Builder Upload Flow**:
+
+1. **Image-based Generation**:
+```typescript
+// Convert images to base64
+const imageBase64 = Buffer.from(imageBytes).toString('base64');
+
+// Submit generation request
+const response = await fetch('https://api.worldlabs.ai/marble/v1/worlds:generate', {
+  method: 'POST',
+  headers: {
+    'WLT-Api-Key': process.env.WLT_API_KEY,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    world_prompt: {
+      type: 'image',
+      text_prompt: null,
+      disable_recaption: !autoEnhance,
+      image_prompt: {
+        source: 'data_base64',
+        data_base64: imageBase64
+      }
+    },
+    model: draft ? 'Marble 0.1-mini' : 'Marble 0.1-plus',
+    seed: null
+  })
+});
+
+const { operation_id } = await response.json();
+
+// Poll for completion
+while (true) {
+  const operation = await fetch(`https://api.worldlabs.ai/marble/v1/operations/${operation_id}`);
+  const opData = await operation.json();
+  
+  if (opData.done) {
+    const world = await fetch(`https://api.worldlabs.ai/marble/v1/worlds/${opData.response.world_id}`);
+    return await world.json();
+  }
+  
+  await sleep(5000); // Wait 5 seconds before retry
+}
+```
+
+2. **Video-based Generation**:
+- Use FFmpeg to extract key frames from video (1 frame per second)
+- Send extracted frames to Marble API as image sequence
+- Marble reconstructs 3D space from multiple viewpoints
+
+3. **Floor Plan Generation**:
+- Parse floor plan dimensions using computer vision
+- Generate base 3D structure (walls, doors, windows) procedurally
+- Use Marble API to enhance with realistic interior details
+
+**User Customization Layer**:
+- World Labs Marble API for all 3D generation:
+  - Full room regeneration with style changes
+  - Individual furniture and decor object generation
+  - Material and texture modifications
+- Text prompts: "Add a modern sofa", "Change wall color to blue"
+- Image prompts: Upload inspiration photos for style matching
+
+**Storage and Delivery**:
 - Store generated models in S3-compatible object storage (AWS S3 or Cloudflare R2)
 - Model format: GLB (GL Transmission Format Binary) for web compatibility
-- Implement timeout of 30 seconds for generation, fallback to base model on failure
+- Implement timeout of 60 seconds for generation, fallback to base model on failure
 - Cache base models in CDN (CloudFront or Cloudflare CDN) for fast loading
 - Texture resolution: 2K for base models, 4K for premium customizations
+
+**Job Queue Processing**:
+- Use job queue (Bull/Redis) for asynchronous 3D generation
+- Queue workers poll Marble API for operation status
+- Notify users via WebSocket when generation completes
+- Store operation_id in database for status tracking
 
 ### 4. Telephony Component
 
@@ -792,10 +897,75 @@ CREATE INDEX idx_audit_logs_created ON audit_logs(created_at);
 
 ## AI Pipeline Flows
 
-### Flow 1: Text-to-3D Customization Pipeline
+### Flow 1: Builder Upload to 3D Model Generation
 
 ```
-User Input (Text Prompt)
+Builder Upload (Image/Video/Floor Plan)
+         │
+         ▼
+┌────────────────────┐
+│ Input Validation   │
+│ - File type check  │
+│ - Size limits      │
+│ - Format verify    │
+└────────┬───────────┘
+         │
+         ▼
+┌────────────────────┐
+│ Pre-Processing     │
+│ - Image: Base64    │
+│ - Video: Extract   │
+│   frames (FFmpeg)  │
+│ - Floor: Parse dims│
+└────────┬───────────┘
+         │
+         ▼
+┌────────────────────┐
+│ Enqueue Job        │
+│ - Add to Redis     │
+│ - Return job ID    │
+└────────┬───────────┘
+         │
+         ▼
+┌────────────────────┐
+│ World Labs API     │
+│ - POST to generate │
+│ - Get operation_id │
+│ - Poll status      │
+└────────┬───────────┘
+         │
+         ▼
+┌────────────────────┐
+│ Download Model     │
+│ - Fetch GLB file   │
+│ - Optimize mesh    │
+│ - Generate preview │
+└────────┬───────────┘
+         │
+         ▼
+┌────────────────────┐
+│ Store & Publish    │
+│ - Upload to S3     │
+│ - Save to DB       │
+│ - Notify builder   │
+│ - Make available   │
+└────────────────────┘
+```
+
+**Implementation Details**:
+- Input validation: Max 50MB per image, 500MB for video, common formats (JPG, PNG, MP4, PDF)
+- Video frame extraction: FFmpeg extracts 1 frame per second, max 60 frames
+- Floor plan parsing: Use computer vision to detect walls, doors, windows
+- Job queue: Bull with Redis backend, 3 concurrent workers for generation
+- World Labs API polling: Check status every 5 seconds, timeout after 5 minutes
+- Mesh optimization: Reduce polygon count to < 100K triangles using mesh decimation
+- Storage: AWS S3 or Cloudflare R2 with CloudFront/Cloudflare CDN for delivery
+- Model viewer: Three.js or Babylon.js for web-based 3D rendering
+
+### Flow 2: User Customization Pipeline
+
+```
+User Input (Text/Image Prompt)
          │
          ▼
 ┌────────────────────┐
@@ -821,9 +991,9 @@ User Input (Text Prompt)
          ▼
 ┌────────────────────┐
 │ AI Generation      │
-│ - Call world model │
-│ - Apply prompt     │
-│ - Generate mesh    │
+│ - Marble API       │
+│ - Text/Image input │
+│ - Generate 3D      │
 └────────┬───────────┘
          │
          ▼
@@ -847,18 +1017,18 @@ User Input (Text Prompt)
 - Prompt validation: Max 500 characters, filter profanity/inappropriate content using content moderation API
 - Base model cache: Redis with 1-hour TTL
 - Job queue: Bull with Redis backend, 5 concurrent workers
-- AI generation: **Luma AI Genie API** for text-to-3D and image-to-3D
-  - Text-to-3D: POST to `/generate` endpoint with prompt and style parameters
-  - Image-to-3D: POST with reference image URL for style conditioning
+- AI generation: 
+  - World Labs Marble API for all 3D generation (rooms, furniture, objects)
+  - Supports both text and image prompts
   - Poll generation status endpoint until completion
   - Download GLB file from provided URL
-- AI generation timeout: 30 seconds, fallback to base model
+- AI generation timeout: 60 seconds, fallback to base model
 - Mesh optimization: Reduce polygon count to < 100K triangles using mesh decimation
 - Storage: AWS S3 or Cloudflare R2 with CloudFront/Cloudflare CDN for delivery
 - Model viewer: Three.js or Babylon.js for web-based 3D rendering
 - Mobile support: Use compressed GLB format for mobile devices
 
-### Flow 2: Call-to-Lead-Score Pipeline
+### Flow 3: Call-to-Lead-Score Pipeline
 
 ```
 User Initiates Call
